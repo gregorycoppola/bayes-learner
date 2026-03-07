@@ -3,7 +3,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Bayes-learner API")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,8 +11,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from bayes_learner.server.routes import health
+from bayes_learner.server.routes import health, train
 app.include_router(health.router)
+app.include_router(train.router)
 
 @app.on_event("startup")
 async def startup():

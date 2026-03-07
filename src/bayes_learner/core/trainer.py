@@ -13,16 +13,11 @@ def train(
     batch_size: int = 64,
     lr: float = 1e-3,
     device: str = "cpu",
+    print_every: int = 1,
 ) -> dict:
-    """
-    Train BPTransformer on random factor graphs.
-    Returns a results dict with loss curve and final accuracy.
-    """
     print(f"Generating {n_graphs} graphs (n_vars={n_vars})...")
     X, Y = make_dataset(n_graphs, n_vars)
-    n = X.shape[1]
 
-    # Train/val split
     split = int(0.9 * n_graphs)
     X_train, Y_train = X[:split].to(device), Y[:split].to(device)
     X_val, Y_val = X[split:].to(device), Y[split:].to(device)
@@ -33,6 +28,9 @@ def train(
     model = BPTransformer().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
+
+    print(f"\n{'Ep':>5}  {'Train Loss':>12}  {'Val MAE':>10}")
+    print("-" * 34)
 
     results = {"epochs": [], "train_loss": [], "val_mae": []}
 
@@ -57,7 +55,9 @@ def train(
         results["train_loss"].append(train_loss)
         results["val_mae"].append(val_mae)
 
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"Ep {epoch:4d}  loss={train_loss:.6f}  val_mae={val_mae:.6f}")
+        if epoch % print_every == 0:
+            print(f"{epoch:>5}  {train_loss:>12.6f}  {val_mae:>10.6f}")
 
+    print("-" * 34)
+    print(f"Done. Final val MAE: {results['val_mae'][-1]:.6f}")
     return results

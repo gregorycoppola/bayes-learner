@@ -4,175 +4,155 @@ import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from bayes_learner.core.model import BPTransformer
-from bayes_learner.core.graph import make_dataset
-from bayes_learner.core.inspect import inspect_weights, compare_posteriors
+from bayes_learner.core.graph import make_dataset, make_graph
 
 
 def train(
-    n_graphs: int = 10000,
-    n_vars: int = 3,
-    epochs: int = 100,
-    batch_size: int = 64,
+    n_graphs: int = 20000,
+    epochs: int = 50,
+    batch_size: int = 256,
     lr: float = 1e-3,
-    inspect_every: int = 25,
-    init: str = "constructed",
-    noise: float = 0.01,
-    ffn_mode: str = "learned",
-    temperature: float = 50.0,
+    d_model: int = 32,
+    n_heads: int = 2,
+    n_layers: int = 2,
+    inspect_every: int = 10,
     device: str = "cpu",
 ) -> dict:
 
     print("=" * 60)
     print("BAYES-LEARNER EXPERIMENT")
-    print(f"Init: {init}  Noise: {noise}  FFN: {ffn_mode}  Temp: {temperature}")
+    print("Can a transformer learn exact Bayesian posteriors?")
     print("=" * 60)
 
-    print(f"\n[DATA] Generating {n_graphs} graphs (n_vars={n_vars})...")
+    # ── Data ──────────────────────────────────────────────────
+    print(f"\n[DATA] Generating {n_graphs} two-variable factor graphs...")
     t0 = time.time()
-    X, Y, var_mask = make_dataset(n_graphs, n_vars)
-    print(f"[DATA] Done in {time.time()-t0:.1f}s  "
-          f"X={list(X.shape)}  Y={list(Y.shape)}")
+    X, Y, var_mask = make_dataset(n_graphs)
+    print(f"[DATA] Done in {time.time()-t0:.1f}s")
+    print(f"[DATA] X={list(X.shape)}  Y={list(Y.shape)}")
 
     Y_vars = Y[var_mask]
     baseline_mae = (Y_vars - 0.5).abs().mean().item()
-    print(f"[DATA] Variable belief stats — "
+    print(f"[DATA] Posterior stats — "
           f"min:{Y_vars.min():.4f}  max:{Y_vars.max():.4f}  "
           f"mean:{Y_vars.mean():.4f}  std:{Y_vars.std():.4f}")
-    print(f"[DATA] Baseline MAE (predict 0.5): {baseline_mae:.4f}")
+    print(f"[DATA] Baseline MAE (always predict 0.5): {baseline_mae:.4f}")
+
+    # Show a few example graphs
+    print(f"[DATA] Sample posteriors:")
+    for i in range(5):
+        g = make_graph()
+        p0, p2 = g.exact_posteriors()
+        print(f"  ft={[f'{v:.2f}' for v in g.factor_table]}  "
+              f"→  P(v0=1)={p0:.4f}  P(v2=1)={p2:.4f}")
 
     split = int(0.9 * n_graphs)
-    X_train = X[:split].to(device)
-    Y_train = Y[:split].to(device)
-    M_train = var_mask[:split].to(device)
-    X_val   = X[split:].to(device)
-    Y_val   = Y[split:].to(device)
-    M_val   = var_mask[split:].to(device)
-    print(f"[DATA] Train: {split}  Val: {n_graphs - split}")
+    X_train, Y_train, M_train = X[:split], Y[:split], var_mask[:split]
+    X_val,   Y_val,   M_val   = X[split:], Y[split:], var_mask[split:]
+    for t in [X_train, Y_train, M_train, X_val, Y_val, M_val]:
+        t = t.to(device)
+    print(f"[DATA] Train: {split}  Val: {n_graphs-split}")
 
-    print(f"\n[MODEL] Building BPTransformer...")
-    model = BPTransformer(init=init, noise=noise,
-                          ffn_mode=ffn_mode,
-                          temperature=temperature).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[MODEL] Trainable parameters: {n_params}")
+    # ── Model ─────────────────────────────────────────────────
+    print(f"\n[MODEL] BPTransformer — "
+          f"d_model={d_model}, heads={n_heads}, layers={n_layers}")
+    model = BPTransformer(d_model=d_model, n_heads=n_heads,
+                          n_layers=n_layers).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[MODEL] Parameters: {n_params}")
 
-    # Sanity check attention routing
-    print(f"\n[SANITY] Attention routing check at init...")
-    with torch.no_grad():
-        x0      = X[:1]
-        n_nodes = x0.shape[1]
-        Q = model.Wq0(x0)
-        K = model.Wk0(x0)
-        scores  = torch.bmm(Q, K.transpose(1, 2))[0]
-        scores_scaled = scores * temperature
-        attn    = torch.softmax(scores_scaled, dim=-1)
-        nb0_idx = int(round(x0[0, 0, 1].item() * (n_nodes - 1)))
-        print(f"[SANITY] Node 0 neighbor0_idx={nb0_idx}")
-        print(f"[SANITY] Raw scores:    {[f'{v:.3f}' for v in scores[0].tolist()]}")
-        print(f"[SANITY] Scaled scores: {[f'{v:.2f}' for v in scores_scaled[0].tolist()]}")
-        print(f"[SANITY] Attn weights:  {[f'{v:.4f}' for v in attn[0].tolist()]}")
-        print(f"[SANITY] Attn at nb0 ({nb0_idx}): {attn[0, nb0_idx].item():.4f}  "
-              f"(uniform={1/n_nodes:.4f})")
-
-    # Oracle: exact construction, no noise
-    print(f"\n[ORACLE] Testing exact BP formula (constructed FFN, no noise)...")
-    oracle = BPTransformer(init="constructed", noise=0.0,
-                           ffn_mode="constructed",
-                           temperature=temperature).to(device)
-    with torch.no_grad():
-        oracle_pred = oracle(X_val)
-        oracle_mae  = (oracle_pred - Y_val)[M_val].abs().mean().item()
-    print(f"[ORACLE] MAE: {oracle_mae:.6f}  "
-          f"(baseline={baseline_mae:.6f}, "
-          f"improvement={100*(baseline_mae-oracle_mae)/baseline_mae:+.1f}%)")
-    for i in range(3):
-        mask    = M_val[i]
-        bp_vals = Y_val[i][mask].tolist()
-        or_vals = oracle_pred[i][mask].tolist()
-        errs    = [abs(a-b) for a,b in zip(bp_vals, or_vals)]
-        print(f"[ORACLE] Graph {i}: "
-              f"BP={[f'{v:.3f}' for v in bp_vals]}  "
-              f"Oracle={[f'{v:.3f}' for v in or_vals]}  "
-              f"MaxErr={max(errs):.4f}")
-
-    if ffn_mode != "constructed":
-        print(f"\n[INSPECT] Weights at init:")
-        inspect_weights(model)
-
-    optimizer = torch.optim.Adam(
-        [p for p in model.parameters() if p.requires_grad], lr=lr)
-    dataset   = TensorDataset(X_train, Y_train, M_train)
-    loader    = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # ── Training ──────────────────────────────────────────────
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, patience=5, factor=0.5, min_lr=1e-5)
+    dataset = TensorDataset(X_train, Y_train, M_train)
+    loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     print(f"\n[TRAIN] {epochs} epochs, batch={batch_size}, lr={lr}")
-    print(f"\n{'Ep':>5}  {'Train Loss':>12}  {'Val MAE':>10}  "
-          f"{'vs Baseline':>12}  {'vs Oracle':>10}  {'Time':>6}")
-    print("-" * 62)
+    print(f"\n{'Ep':>5}  {'Loss':>10}  {'Val MAE':>10}  "
+          f"{'Baseline':>10}  {'Improv':>8}  {'LR':>8}  {'Time':>6}")
+    print("-" * 64)
 
     results = {"epochs": [], "train_loss": [], "val_mae": []}
+    best_mae = float("inf")
 
     for epoch in range(1, epochs + 1):
         t_ep = time.time()
         model.train()
         total_loss, total_n = 0.0, 0
 
-        for batch_idx, (xb, yb, mb) in enumerate(loader):
+        for xb, yb, mb in loader:
+            xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
             pred = model(xb)
-            diff = (pred - yb) ** 2
-            loss = diff[mb].mean()
+            loss = ((pred - yb) ** 2)[mb].mean()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * mb.sum().item()
             total_n    += mb.sum().item()
 
-            if epoch == 1 and batch_idx == 0:
-                print(f"[TRAIN] Ep1 batch0 — loss={loss.item():.6f}  "
-                      f"pred_mean={pred[mb].mean():.4f}  "
-                      f"pred_std={pred[mb].std():.4f}")
-
         train_loss = total_loss / total_n
         model.eval()
         with torch.no_grad():
-            val_pred = model(X_val)
-            val_mae  = (val_pred - Y_val)[M_val].abs().mean().item()
+            val_pred = model(X_val.to(device))
+            val_mae  = (val_pred - Y_val.to(device))[M_val.to(device)].abs().mean().item()
 
+        scheduler.step(val_mae)
         improvement = (baseline_mae - val_mae) / baseline_mae * 100
-        vs_oracle   = val_mae - oracle_mae
+        current_lr  = optimizer.param_groups[0]["lr"]
         ep_time     = time.time() - t_ep
+
+        if val_mae < best_mae:
+            best_mae = val_mae
 
         results["epochs"].append(epoch)
         results["train_loss"].append(train_loss)
         results["val_mae"].append(val_mae)
 
-        print(f"{epoch:>5}  {train_loss:>12.6f}  {val_mae:>10.6f}  "
-              f"{improvement:>+11.1f}%  {vs_oracle:>+10.4f}  {ep_time:>5.2f}s")
+        print(f"{epoch:>5}  {train_loss:>10.6f}  {val_mae:>10.6f}  "
+              f"{baseline_mae:>10.6f}  {improvement:>+7.1f}%  "
+              f"{current_lr:>8.6f}  {ep_time:>5.2f}s")
 
         if epoch % inspect_every == 0:
-            print(f"\n[INSPECT] Epoch {epoch}:")
-            if ffn_mode != "constructed":
-                inspect_weights(model)
-            compare_posteriors(model, X_val, Y_val, M_val, n_examples=3)
-            print()
+            _compare_posteriors(model, X_val, Y_val, M_val, device, n=5)
 
+    # ── Final report ──────────────────────────────────────────
     print("\n" + "=" * 60)
     print("FINAL REPORT")
     print("=" * 60)
     final_mae   = results["val_mae"][-1]
     improvement = (baseline_mae - final_mae) / baseline_mae * 100
-    print(f"Final val MAE:    {final_mae:.6f}")
-    print(f"Oracle MAE:       {oracle_mae:.6f}")
-    print(f"Baseline MAE:     {baseline_mae:.6f}")
-    print(f"Improvement:      {improvement:+.1f}%")
-    print(f"Gap to oracle:    {final_mae - oracle_mae:+.6f}")
-    if final_mae <= oracle_mae * 1.05:
-        print(f"Result: ✓ STRONG POSITIVE — matches oracle")
+    print(f"Final val MAE:  {final_mae:.6f}")
+    print(f"Best val MAE:   {best_mae:.6f}")
+    print(f"Baseline MAE:   {baseline_mae:.6f}")
+    print(f"Improvement:    {improvement:+.1f}%")
+    if final_mae < 0.005:
+        print("Result: ✓ STRONG POSITIVE — near-exact posterior matching")
+    elif improvement > 50:
+        print("Result: ~ GOOD — substantial improvement over baseline")
     elif improvement > 20:
-        print(f"Result: ~ PARTIAL — learning but not reaching oracle")
+        print("Result: ~ PARTIAL — learning but not converged")
     else:
-        print(f"Result: ✗ NEGATIVE — not learning")
+        print("Result: ✗ NEGATIVE — not learning")
 
-    if ffn_mode != "constructed":
-        inspect_weights(model)
-    compare_posteriors(model, X_val, Y_val, M_val, n_examples=5)
+    _compare_posteriors(model, X_val, Y_val, M_val, device, n=10)
     return results
+
+
+def _compare_posteriors(model, X_val, Y_val, M_val, device, n=5):
+    model.eval()
+    print(f"\n{'─'*60}")
+    print(f"POSTERIOR COMPARISON (BP exact vs Transformer)")
+    print(f"{'─'*60}")
+    with torch.no_grad():
+        pred = model(X_val[:n].to(device))
+    for i in range(n):
+        mask    = M_val[i]
+        bp      = Y_val[i][mask].tolist()
+        tf      = pred[i][mask].tolist()
+        errs    = [abs(a - b) for a, b in zip(bp, tf)]
+        print(f"Graph {i:2d}:  "
+              f"BP=[{', '.join(f'{v:.4f}' for v in bp)}]  "
+              f"TF=[{', '.join(f'{v:.4f}' for v in tf)}]  "
+              f"MaxErr={max(errs):.4f}  MeanErr={sum(errs)/len(errs):.4f}")
+    print(f"{'─'*60}")

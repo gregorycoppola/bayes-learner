@@ -52,21 +52,24 @@ def train(
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[MODEL] Parameters: {n_params}")
 
-    # Check attention behavior at init
+    # Sanity check attention at init
     print(f"\n[SANITY] Checking attention scores at init...")
     with torch.no_grad():
-        x0 = X[:1]  # one graph [1, n, 8]
-        Q = model.Wq0(x0)
+        x0 = X[:1]  # [1, n, 8]
+        n_nodes = x0.shape[1]
+        Q = model.Wq0(x0)   # [1, n, 8]
         K = model.Wk0(x0)
         scores = torch.bmm(Q, K.transpose(1, 2))[0]  # [n, n]
-        attn = torch.softmax(scores, dim=-1)[0]
-        print(f"[SANITY] Head 0 attention for node 0 (should peak at neighbor 0):")
-        print(f"  scores: {scores[0].tolist()}")
-        print(f"  attn:   {[f'{v:.4f}' for v in attn[0].tolist()]}")
-        print(f"  neighbor 0 of node 0: dim1={x0[0,0,1].item():.0f}")
-        # Check what node index matches
+        attn   = torch.softmax(scores, dim=-1)        # [n, n]
         nb0_idx = int(x0[0, 0, 1].item())
-        print(f"  attn at neighbor index {nb0_idx}: {attn[0, nb0_idx].item():.4f}")
+        print(f"[SANITY] Node 0: neighbor0_idx={nb0_idx}")
+        print(f"[SANITY] Head 0 scores for node 0: "
+              f"{[f'{v:.3f}' for v in scores[0].tolist()]}")
+        print(f"[SANITY] Head 0 attn   for node 0: "
+              f"{[f'{v:.4f}' for v in attn[0].tolist()]}")
+        print(f"[SANITY] Attn at correct neighbor ({nb0_idx}): "
+              f"{attn[0, nb0_idx].item():.4f}  "
+              f"(uniform would be {1/n_nodes:.4f})")
 
     print(f"\n[INSPECT] Weights at init:")
     inspect_weights(model)

@@ -1,13 +1,22 @@
 """
-Two-head transformer matching the construction in Attention.lean.
+Two-head transformer for BP inference.
 
-CORRECTED ENCODING:
-  dim 1 = neighbor 0 index → Wq0 queries on this (projectDim(1))
-  dim 2 = neighbor 1 index → Wq1 queries on this (projectDim(2))
-  dim 6 = own index        → Wk0, Wk1 key on this (projectDim(6))
+Key insight: dot-product attention can implement neighbor lookup when
+Q·K peaks at the target neighbor. With normalized indices in [0,1]:
+  score(j→k) = (nb_idx_j / (n-1)) * (own_idx_k / (n-1))
+This is maximized when own_idx_k == nb_idx_j AND both are large.
+It does NOT implement exact equality matching.
 
-Score for head 0: Q·K = emb[1] * emb[6] = (nb0_index) * (own_index)
-Peaks when own_index == nb0_index, i.e. when we're looking at neighbor 0.
+Temperature scaling amplifies score gaps, pushing softmax toward hardmax.
+The Lean proof uses λ→∞ (hardmax limit). We use a large fixed temperature.
+
+Constructed weights:
+  Wq0[1,1]=1: query reads dim1 (neighbor0 index, normalized)
+  Wk0[1,6]=1: key   reads dim6 (own index, normalized)  → score = nb0*own
+  Wv0[4,0]=1: value reads dim0 (belief) → writes dim4 (scratch0)
+  Wq1[2,2]=1: query reads dim2 (neighbor1 index, normalized)
+  Wk1[2,6]=1: key   reads dim6 (own index, normalized)
+  Wv1[5,0]=1: value reads dim0 (belief) → writes dim5 (scratch1)
 """
 import torch
 import torch.nn as nn
@@ -18,26 +27,26 @@ EPS = 1e-6
 
 
 def logit(p: torch.Tensor) -> torch.Tensor:
-    return torch.log(p.clamp(EPS, 1 - EPS) / (1 - p.clamp(EPS, 1 - EPS)))
+    return torch.log(p.clamp(EPS, 1-EPS) / (1 - p.clamp(EPS, 1-EPS)))
 
 
 def constructed_Wq0():
-    W = torch.zeros(D_MODEL, D_MODEL); W[1, 1] = 1.0; return W  # query on dim 1
+    W = torch.zeros(D_MODEL, D_MODEL); W[1, 1] = 1.0; return W
 
 def constructed_Wk0():
-    W = torch.zeros(D_MODEL, D_MODEL); W[1, 6] = 1.0; return W  # key: dim1 output ← dim6 input
+    W = torch.zeros(D_MODEL, D_MODEL); W[1, 6] = 1.0; return W
 
 def constructed_Wv0():
-    W = torch.zeros(D_MODEL, D_MODEL); W[4, 0] = 1.0; return W  # belief → scratch 0
+    W = torch.zeros(D_MODEL, D_MODEL); W[4, 0] = 1.0; return W
 
 def constructed_Wq1():
-    W = torch.zeros(D_MODEL, D_MODEL); W[2, 2] = 1.0; return W  # query on dim 2
+    W = torch.zeros(D_MODEL, D_MODEL); W[2, 2] = 1.0; return W
 
 def constructed_Wk1():
-    W = torch.zeros(D_MODEL, D_MODEL); W[2, 6] = 1.0; return W  # key: dim2 output ← dim6 input
+    W = torch.zeros(D_MODEL, D_MODEL); W[2, 6] = 1.0; return W
 
 def constructed_Wv1():
-    W = torch.zeros(D_MODEL, D_MODEL); W[5, 0] = 1.0; return W  # belief → scratch 1
+    W = torch.zeros(D_MODEL, D_MODEL); W[5, 0] = 1.0; return W
 
 CONSTRUCTED = {
     "Wq0": (constructed_Wq0, (1, 1)),
@@ -48,14 +57,7 @@ CONSTRUCTED = {
     "Wv1": (constructed_Wv1, (5, 0)),
 }
 
-CONSTRUCTORS = {
-    "Wq0": constructed_Wq0,
-    "Wk0": constructed_Wk0,
-    "Wv0": constructed_Wv0,
-    "Wq1": constructed_Wq1,
-    "Wk1": constructed_Wk1,
-    "Wv1": constructed_Wv1,
-}
+CONSTRUCTORS = {k: v[0] for k, v in CONSTRUCTED.items()}
 
 
 class BPUpdateFFN(nn.Module):
@@ -77,17 +79,17 @@ class BPUpdateFFN(nn.Module):
         m1 = x[:, :, 5]
         if self.mode == "constructed":
             return torch.sigmoid(logit(b) + logit(m0) + logit(m1))
-        else:
-            inp = torch.stack([b, m0, m1], dim=-1)
-            return torch.sigmoid(self.net(inp).squeeze(-1))
+        inp = torch.stack([b, m0, m1], dim=-1)
+        return torch.sigmoid(self.net(inp).squeeze(-1))
 
 
 class BPTransformer(nn.Module):
     def __init__(self, init: str = "constructed", noise: float = 0.01,
-                 ffn_mode: str = "learned"):
+                 ffn_mode: str = "learned", temperature: float = 50.0):
         super().__init__()
-        self.init_mode = init
-        self.ffn_mode  = ffn_mode
+        self.init_mode   = init
+        self.ffn_mode    = ffn_mode
+        self.temperature = temperature
         self.Wq0 = nn.Linear(D_MODEL, D_MODEL, bias=False)
         self.Wk0 = nn.Linear(D_MODEL, D_MODEL, bias=False)
         self.Wv0 = nn.Linear(D_MODEL, D_MODEL, bias=False)
@@ -104,13 +106,14 @@ class BPTransformer(nn.Module):
             if noise > 0:
                 W = W + torch.randn_like(W) * noise
             getattr(self, name).weight.data.copy_(W)
-        print(f"[MODEL] Initialized from Attention.lean construction (noise={noise})")
+        print(f"[MODEL] Initialized from Attention.lean construction "
+              f"(noise={noise}, temperature={self.temperature})")
 
     def attention_head(self, x, Wq, Wk, Wv):
         Q = Wq(x)
         K = Wk(x)
         V = Wv(x)
-        scores = torch.bmm(Q, K.transpose(1, 2))
+        scores = torch.bmm(Q, K.transpose(1, 2)) * self.temperature
         attn   = F.softmax(scores, dim=-1)
         return torch.bmm(attn, V)
 

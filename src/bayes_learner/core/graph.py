@@ -1,20 +1,25 @@
 """
-Random tree-structured factor graph generation and exact BP.
+Factor graph generation and exact BP.
 
-Encoding (updated to match what the attention construction actually needs):
-  dim 0 = belief (init 0.5)
-  dim 1 = neighbor 0 index (float) — query for head 0
-  dim 2 = neighbor 1 index (float) — query for head 1
-  dim 3 = node type (0=variable, 1=factor)
-  dim 4 = scratch 0 (0.0)
-  dim 5 = scratch 1 (0.0)
-  dim 6 = own index (float) — key for both heads
-  dim 7 = unused (0.0)
+ENCODING (revised for correct attention routing):
+  dim 0   = belief (init 0.5)
+  dim 1   = neighbor 0 index / (n-1)  — normalized, used as query for head 0
+  dim 2   = neighbor 1 index / (n-1)  — normalized, used as query for head 1
+  dim 3   = node type (0=variable, 1=factor)
+  dim 4   = scratch 0 (0.0)
+  dim 5   = scratch 1 (0.0)
+  dim 6   = own index / (n-1)         — normalized, used as key for both heads
+  dim 7   = unused
 
-Head 0 attention: node j queries with dim1 (neighbor0 index),
-                  node k keys with dim6 (own index).
-                  Score peaks when k's own index == j's neighbor0 index.
-                  This correctly routes to neighbor 0.
+Normalization: divide all indices by (n-1) so they live in [0,1].
+Q·K for head 0 = (nb0_idx/(n-1)) * (own_idx/(n-1))
+This still doesn't peak at equality — but with a large temperature
+multiplier the gap between matching and non-matching is maximized
+when scores are close to 1 vs close to 0.
+
+NOTE: For exact routing we would need one-hot encodings or a large
+enough temperature. This encoding tests whether gradient descent can
+learn to exploit the monotonic relationship between score and index.
 """
 import torch
 import random
@@ -33,15 +38,15 @@ class FactorGraph:
     neighbors: List[List[int]]
     factor_table: List[List[float]]
 
-    def encode(self) -> torch.Tensor:
+    def encode(self, normalize: bool = True) -> torch.Tensor:
         emb = torch.zeros(self.n, D_MODEL)
+        scale = float(self.n - 1) if normalize and self.n > 1 else 1.0
         for j in range(self.n):
-            emb[j, 0] = 0.5                          # belief
-            emb[j, 1] = float(self.neighbors[j][0])  # neighbor 0 index (query)
-            emb[j, 2] = float(self.neighbors[j][1])  # neighbor 1 index (query)
-            emb[j, 3] = float(self.node_type[j])     # node type
-            # dim 4,5 = scratch (0.0)
-            emb[j, 6] = float(j)                     # own index (key)
+            emb[j, 0] = 0.5
+            emb[j, 1] = self.neighbors[j][0] / scale
+            emb[j, 2] = self.neighbors[j][1] / scale
+            emb[j, 3] = float(self.node_type[j])
+            emb[j, 6] = j / scale  # own index normalized
         return emb
 
 
@@ -50,7 +55,7 @@ def make_chain(n_vars: int) -> FactorGraph:
     n = 2 * n_vars - 1
     node_type = [0 if i % 2 == 0 else 1 for i in range(n)]
     var_neighbors: List[List[int]] = [[] for _ in range(n)]
-    factor_table = [[1.0] * 4 for _ in range(n)]
+    factor_table  = [[1.0] * 4 for _ in range(n)]
 
     for fi in range(n_vars - 1):
         f_idx = 2 * fi + 1
@@ -129,8 +134,8 @@ def make_dataset(n_graphs: int, n_vars: int = 5, log_every: int = 1000):
     for i in range(n_graphs):
         graphs.append(make_chain(n_vars))
         if (i + 1) % log_every == 0:
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed
+            elapsed  = time.time() - t0
+            rate     = (i + 1) / elapsed
             remaining = (n_graphs - i - 1) / rate
             print(f"[DATA]   {i+1}/{n_graphs} graphs "
                   f"({rate:.0f}/s, ~{remaining:.0f}s remaining)")

@@ -2,32 +2,25 @@
 from bayes_learner.core.trainer import train
 
 def add_subparser(subparsers):
-    p = subparsers.add_parser("train", help="Run the BP weight learning experiment")
-    p.add_argument("--graphs",        type=int,   default=10000)
-    p.add_argument("--vars",          type=int,   default=3)
-    p.add_argument("--epochs",        type=int,   default=100)
-    p.add_argument("--batch-size",    type=int,   default=64)
+    p = subparsers.add_parser("train", help="Train transformer on exact BP posteriors")
+    p.add_argument("--graphs",        type=int,   default=20000)
+    p.add_argument("--epochs",        type=int,   default=50)
+    p.add_argument("--batch-size",    type=int,   default=256)
     p.add_argument("--lr",            type=float, default=1e-3)
-    p.add_argument("--inspect-every", type=int,   default=25)
-    p.add_argument("--init",          type=str,   default="constructed",
-                   choices=["constructed", "random"])
-    p.add_argument("--noise",         type=float, default=0.01)
-    p.add_argument("--ffn",           type=str,   default="learned",
-                   choices=["learned", "constructed"])
-    p.add_argument("--temperature",   type=float, default=50.0,
-                   help="Softmax temperature multiplier (higher = closer to hardmax)")
+    p.add_argument("--d-model",       type=int,   default=32)
+    p.add_argument("--n-heads",       type=int,   default=2)
+    p.add_argument("--n-layers",      type=int,   default=2)
+    p.add_argument("--inspect-every", type=int,   default=10)
     p.set_defaults(func=cmd_train)
 
 def cmd_train(args):
     train(
         n_graphs=args.graphs,
-        n_vars=args.vars,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
         inspect_every=args.inspect_every,
-        init=args.init,
-        noise=args.noise,
-        ffn_mode=args.ffn,
-        temperature=args.temperature,
     )

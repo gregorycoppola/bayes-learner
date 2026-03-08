@@ -1,14 +1,13 @@
 """
 Two-head transformer matching the construction in Attention.lean.
 
-Attention weights (learned, match construction):
-  Head 0: Wq0/Wk0 project dim 1 → routes neighbor 0's belief to dim 4
-  Head 1: Wq1/Wk1 project dim 2 → routes neighbor 1's belief to dim 5
+CORRECTED ENCODING:
+  dim 1 = neighbor 0 index → Wq0 queries on this (projectDim(1))
+  dim 2 = neighbor 1 index → Wq1 queries on this (projectDim(2))
+  dim 6 = own index        → Wk0, Wk1 key on this (projectDim(6))
 
-FFN (BP update in log-odds space):
-  BP update: new_belief = sigmoid(logit(b) + logit(msg0) + logit(msg1))
-  where b = dim 0, msg0 = dim 4, msg1 = dim 5
-  This is the correct inductive bias for belief propagation.
+Score for head 0: Q·K = emb[1] * emb[6] = (nb0_index) * (own_index)
+Peaks when own_index == nb0_index, i.e. when we're looking at neighbor 0.
 """
 import torch
 import torch.nn as nn
@@ -19,34 +18,33 @@ EPS = 1e-6
 
 
 def logit(p: torch.Tensor) -> torch.Tensor:
-    p = p.clamp(EPS, 1 - EPS)
-    return torch.log(p / (1 - p))
+    return torch.log(p.clamp(EPS, 1 - EPS) / (1 - p.clamp(EPS, 1 - EPS)))
 
 
 def constructed_Wq0():
-    W = torch.zeros(D_MODEL, D_MODEL); W[1, 1] = 1.0; return W
+    W = torch.zeros(D_MODEL, D_MODEL); W[1, 1] = 1.0; return W  # query on dim 1
 
 def constructed_Wk0():
-    W = torch.zeros(D_MODEL, D_MODEL); W[1, 1] = 1.0; return W
+    W = torch.zeros(D_MODEL, D_MODEL); W[1, 6] = 1.0; return W  # key: dim1 output ← dim6 input
 
 def constructed_Wv0():
-    W = torch.zeros(D_MODEL, D_MODEL); W[4, 0] = 1.0; return W
+    W = torch.zeros(D_MODEL, D_MODEL); W[4, 0] = 1.0; return W  # belief → scratch 0
 
 def constructed_Wq1():
-    W = torch.zeros(D_MODEL, D_MODEL); W[2, 2] = 1.0; return W
+    W = torch.zeros(D_MODEL, D_MODEL); W[2, 2] = 1.0; return W  # query on dim 2
 
 def constructed_Wk1():
-    W = torch.zeros(D_MODEL, D_MODEL); W[2, 2] = 1.0; return W
+    W = torch.zeros(D_MODEL, D_MODEL); W[2, 6] = 1.0; return W  # key: dim2 output ← dim6 input
 
 def constructed_Wv1():
-    W = torch.zeros(D_MODEL, D_MODEL); W[5, 0] = 1.0; return W
+    W = torch.zeros(D_MODEL, D_MODEL); W[5, 0] = 1.0; return W  # belief → scratch 1
 
 CONSTRUCTED = {
     "Wq0": (constructed_Wq0, (1, 1)),
-    "Wk0": (constructed_Wk0, (1, 1)),
+    "Wk0": (constructed_Wk0, (1, 6)),
     "Wv0": (constructed_Wv0, (4, 0)),
     "Wq1": (constructed_Wq1, (2, 2)),
-    "Wk1": (constructed_Wk1, (2, 2)),
+    "Wk1": (constructed_Wk1, (2, 6)),
     "Wv1": (constructed_Wv1, (5, 0)),
 }
 
@@ -61,23 +59,12 @@ CONSTRUCTORS = {
 
 
 class BPUpdateFFN(nn.Module):
-    """
-    FFN that computes the BP belief update.
-
-    Two modes:
-      'learned'     — standard MLP, learns the update from data
-      'constructed' — exact BP update: sigmoid(logit(b) + logit(m0) + logit(m1))
-                      no learned parameters, directly implements the formula
-
-    The constructed version verifies the attention is working correctly.
-    The learned version tests whether gradient descent finds the BP update.
-    """
     def __init__(self, mode: str = "learned"):
         super().__init__()
         self.mode = mode
         if mode == "learned":
             self.net = nn.Sequential(
-                nn.Linear(3, 32),   # inputs: dim0 (belief), dim4 (msg0), dim5 (msg1)
+                nn.Linear(3, 32),
                 nn.ReLU(),
                 nn.Linear(32, 32),
                 nn.ReLU(),
@@ -85,31 +72,19 @@ class BPUpdateFFN(nn.Module):
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [batch, n, 8]
-        returns: [batch, n] updated beliefs
-        """
-        b   = x[:, :, 0]  # dim 0: current belief
-        m0  = x[:, :, 4]  # dim 4: neighbor 0's belief (gathered by head 0)
-        m1  = x[:, :, 5]  # dim 5: neighbor 1's belief (gathered by head 1)
-
+        b  = x[:, :, 0]
+        m0 = x[:, :, 4]
+        m1 = x[:, :, 5]
         if self.mode == "constructed":
-            # Exact BP update in log-odds space
             return torch.sigmoid(logit(b) + logit(m0) + logit(m1))
         else:
-            # Learned: feed [b, m0, m1] to MLP
-            inp = torch.stack([b, m0, m1], dim=-1)  # [batch, n, 3]
+            inp = torch.stack([b, m0, m1], dim=-1)
             return torch.sigmoid(self.net(inp).squeeze(-1))
 
 
 class BPTransformer(nn.Module):
     def __init__(self, init: str = "constructed", noise: float = 0.01,
                  ffn_mode: str = "learned"):
-        """
-        init:     "constructed" | "random" — attention weight initialization
-        ffn_mode: "learned"     — MLP learns BP update from data
-                  "constructed" — exact BP formula, no parameters (oracle)
-        """
         super().__init__()
         self.init_mode = init
         self.ffn_mode  = ffn_mode
@@ -120,7 +95,6 @@ class BPTransformer(nn.Module):
         self.Wk1 = nn.Linear(D_MODEL, D_MODEL, bias=False)
         self.Wv1 = nn.Linear(D_MODEL, D_MODEL, bias=False)
         self.ffn = BPUpdateFFN(mode=ffn_mode)
-
         if init == "constructed":
             self._init_from_construction(noise)
 
@@ -141,8 +115,6 @@ class BPTransformer(nn.Module):
         return torch.bmm(attn, V)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Attention: gather neighbor beliefs into dims 4 and 5
         x = x + self.attention_head(x, self.Wq0, self.Wk0, self.Wv0)
         x = x + self.attention_head(x, self.Wq1, self.Wk1, self.Wv1)
-        # FFN: compute updated belief from dims 0, 4, 5
         return self.ffn(x)

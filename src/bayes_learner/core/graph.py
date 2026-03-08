@@ -1,21 +1,24 @@
 """
 Random tree-structured factor graph generation and exact BP.
 
-Encoding matches encodeBPState from transformer-bp-lean/Preliminaries.lean:
+Encoding (updated to match what the attention construction actually needs):
   dim 0 = belief (init 0.5)
-  dim 1 = neighbor 0 index (float)
-  dim 2 = neighbor 1 index (float)
+  dim 1 = neighbor 0 index (float) — query for head 0
+  dim 2 = neighbor 1 index (float) — query for head 1
   dim 3 = node type (0=variable, 1=factor)
   dim 4 = scratch 0 (0.0)
   dim 5 = scratch 1 (0.0)
-  dim 6,7 = unused (0.0)
+  dim 6 = own index (float) — key for both heads
+  dim 7 = unused (0.0)
 
-Chain topology: v0 - f1 - v2 - f3 - v4 - ...
-  variable nodes at even indices: 0, 2, 4, ...
-  factor nodes at odd indices:    1, 3, 5, ...
+Head 0 attention: node j queries with dim1 (neighbor0 index),
+                  node k keys with dim6 (own index).
+                  Score peaks when k's own index == j's neighbor0 index.
+                  This correctly routes to neighbor 0.
 """
 import torch
 import random
+import time
 from dataclasses import dataclass
 from typing import List
 
@@ -33,10 +36,12 @@ class FactorGraph:
     def encode(self) -> torch.Tensor:
         emb = torch.zeros(self.n, D_MODEL)
         for j in range(self.n):
-            emb[j, 0] = 0.5
-            emb[j, 1] = float(self.neighbors[j][0])
-            emb[j, 2] = float(self.neighbors[j][1])
-            emb[j, 3] = float(self.node_type[j])
+            emb[j, 0] = 0.5                          # belief
+            emb[j, 1] = float(self.neighbors[j][0])  # neighbor 0 index (query)
+            emb[j, 2] = float(self.neighbors[j][1])  # neighbor 1 index (query)
+            emb[j, 3] = float(self.node_type[j])     # node type
+            # dim 4,5 = scratch (0.0)
+            emb[j, 6] = float(j)                     # own index (key)
         return emb
 
 
@@ -119,11 +124,6 @@ def run_bp(fg: FactorGraph, n_iters: int = 50) -> List[float]:
 
 
 def make_dataset(n_graphs: int, n_vars: int = 5, log_every: int = 1000):
-    """
-    Returns X [n_graphs, n, 8], Y [n_graphs, n], var_mask [n_graphs, n].
-    Logs progress every log_every graphs.
-    """
-    import time
     t0 = time.time()
     graphs = []
     for i in range(n_graphs):

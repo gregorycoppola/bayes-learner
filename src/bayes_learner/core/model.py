@@ -1,61 +1,113 @@
 """
-Transformer matching the construction in Attention.lean.
+Two-head transformer matching the construction in Attention.lean.
 
-Architecture:
-  d_model = 8
-  2 attention heads
-  Head 0: Q/K on dim 1 (neighbor 0 index), V: dim 0 → dim 4
-  Head 1: Q/K on dim 2 (neighbor 1 index), V: dim 0 → dim 5
-  FFN: reads dims 4,5 (gathered neighbor beliefs), writes updated belief to dim 0
+d_model = 8
+Head 0: Wq0/Wk0 project dim 1, Wv0 routes dim 0 → dim 4
+Head 1: Wq1/Wk1 project dim 2, Wv1 routes dim 0 → dim 5
+FFN:    reads dims 4,5, predicts updated belief
 
-This matches the explicit weight construction proven in transformer-bp-lean.
+No LayerNorm — it would destroy the index values in dims 1 and 2
+that the attention heads use for routing.
+
+Constructed target weights (from Attention.lean):
+  Wq0[1][1] = 1.0, all else 0  (projectDim(1))
+  Wk0[1][1] = 1.0, all else 0  (projectDim(1))
+  Wv0[4][0] = 1.0, all else 0  (crossProject(0→4))
+  Wq1[2][2] = 1.0, all else 0  (projectDim(2))
+  Wk1[2][2] = 1.0, all else 0  (projectDim(2))
+  Wv1[5][0] = 1.0, all else 0  (crossProject(0→5))
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 D_MODEL = 8
-K = 2
+
+
+# The constructed weight matrices from Attention.lean
+def constructed_Wq0() -> torch.Tensor:
+    W = torch.zeros(D_MODEL, D_MODEL)
+    W[1, 1] = 1.0
+    return W
+
+def constructed_Wk0() -> torch.Tensor:
+    W = torch.zeros(D_MODEL, D_MODEL)
+    W[1, 1] = 1.0
+    return W
+
+def constructed_Wv0() -> torch.Tensor:
+    W = torch.zeros(D_MODEL, D_MODEL)
+    W[4, 0] = 1.0
+    return W
+
+def constructed_Wq1() -> torch.Tensor:
+    W = torch.zeros(D_MODEL, D_MODEL)
+    W[2, 2] = 1.0
+    return W
+
+def constructed_Wk1() -> torch.Tensor:
+    W = torch.zeros(D_MODEL, D_MODEL)
+    W[2, 2] = 1.0
+    return W
+
+def constructed_Wv1() -> torch.Tensor:
+    W = torch.zeros(D_MODEL, D_MODEL)
+    W[5, 0] = 1.0
+    return W
+
+CONSTRUCTED = {
+    "Wq0": (constructed_Wq0, (1, 1)),  # (constructor, expected argmax (row,col))
+    "Wk0": (constructed_Wk0, (1, 1)),
+    "Wv0": (constructed_Wv0, (4, 0)),
+    "Wq1": (constructed_Wq1, (2, 2)),
+    "Wk1": (constructed_Wk1, (2, 2)),
+    "Wv1": (constructed_Wv1, (5, 0)),
+}
 
 
 class BPTransformer(nn.Module):
     """
-    Single-round BP transformer.
-    Input:  [batch, n, 8] encoded factor graph state
-    Output: [batch, n]    predicted beliefs after one BP round
+    Two-head transformer for BP inference.
+    Input:  [batch, n, 8]
+    Output: [batch, n] beliefs in [0,1]
     """
-    def __init__(self, d_model: int = D_MODEL, n_heads: int = K):
+    def __init__(self):
         super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        # Standard multi-head attention — let gradient descent find the weights
-        self.attention = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            batch_first=True,
-            bias=False,
-        )
-        # FFN: 2-layer, reads all 8 dims, outputs 8 dims
+        # Separate Q/K/V per head — no fused projection
+        # nn.Linear(in, out): weight shape [out, in]
+        # so W[i][j] = weight from input dim j to output dim i
+        # matches Lean convention: Wv[d][i] = 1 means read i, write d
+        self.Wq0 = nn.Linear(D_MODEL, D_MODEL, bias=False)
+        self.Wk0 = nn.Linear(D_MODEL, D_MODEL, bias=False)
+        self.Wv0 = nn.Linear(D_MODEL, D_MODEL, bias=False)
+        self.Wq1 = nn.Linear(D_MODEL, D_MODEL, bias=False)
+        self.Wk1 = nn.Linear(D_MODEL, D_MODEL, bias=False)
+        self.Wv1 = nn.Linear(D_MODEL, D_MODEL, bias=False)
+        # FFN reads full 8-dim embedding after attention, predicts belief
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
+            nn.Linear(D_MODEL, 32),
             nn.ReLU(),
-            nn.Linear(d_model * 4, d_model),
+            nn.Linear(32, 1),
         )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        # Final readout: extract belief from dim 0
-        self.readout = nn.Linear(d_model, 1)
+
+    def attention_head(self, x, Wq, Wk, Wv):
+        """
+        Single attention head with softmax routing.
+        x: [batch, n, d]
+        returns: [batch, n, d] attended values (no residual here)
+        """
+        Q = Wq(x)  # [batch, n, d]
+        K = Wk(x)  # [batch, n, d]
+        V = Wv(x)  # [batch, n, d]
+        scores = torch.bmm(Q, K.transpose(1, 2))  # [batch, n, n]
+        attn   = F.softmax(scores, dim=-1)         # [batch, n, n]
+        return torch.bmm(attn, V)                  # [batch, n, d]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [batch, n, 8]
-        returns: [batch, n] belief predictions in [0,1]
-        """
-        # Attention + residual
-        attn_out, _ = self.attention(x, x, x)
-        x = self.norm1(x + attn_out)
-        # FFN + residual
-        ffn_out = self.ffn(x)
-        x = self.norm2(x + ffn_out)
-        # Readout: one scalar per node
-        out = self.readout(x).squeeze(-1)  # [batch, n]
+        # Head 0: gather neighbor 0's belief into dim 4
+        x = x + self.attention_head(x, self.Wq0, self.Wk0, self.Wv0)
+        # Head 1: gather neighbor 1's belief into dim 5
+        x = x + self.attention_head(x, self.Wq1, self.Wk1, self.Wv1)
+        # FFN: read gathered beliefs, predict updated belief
+        out = self.ffn(x).squeeze(-1)  # [batch, n]
         return torch.sigmoid(out)

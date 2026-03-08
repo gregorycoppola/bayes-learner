@@ -8,7 +8,7 @@ def add_subparser(subparsers):
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--analyze", action="store_true", help="Print target stats and exit")
+    p.add_argument("--analyze", action="store_true")
     p.set_defaults(func=cmd_train)
 
 def cmd_train(args):

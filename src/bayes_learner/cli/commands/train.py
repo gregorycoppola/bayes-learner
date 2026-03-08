@@ -10,10 +10,11 @@ def add_subparser(subparsers):
     p.add_argument("--lr",            type=float, default=1e-3)
     p.add_argument("--inspect-every", type=int,   default=25)
     p.add_argument("--init",          type=str,   default="constructed",
-                   choices=["constructed", "random"],
-                   help="constructed=start from Attention.lean weights, random=kaiming")
-    p.add_argument("--noise",         type=float, default=0.01,
-                   help="Noise added to constructed init")
+                   choices=["constructed", "random"])
+    p.add_argument("--noise",         type=float, default=0.01)
+    p.add_argument("--ffn",           type=str,   default="learned",
+                   choices=["learned", "constructed"],
+                   help="learned=MLP learns BP update, constructed=exact BP formula")
     p.set_defaults(func=cmd_train)
 
 def cmd_train(args):
@@ -26,4 +27,5 @@ def cmd_train(args):
         inspect_every=args.inspect_every,
         init=args.init,
         noise=args.noise,
+        ffn_mode=args.ffn,
     )

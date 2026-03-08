@@ -1,4 +1,4 @@
-"""Training loop — logs everything useful for development."""
+"""Training loop."""
 import time
 import torch
 import torch.nn as nn
@@ -15,23 +15,21 @@ def train(
     batch_size: int = 64,
     lr: float = 1e-3,
     inspect_every: int = 25,
+    init: str = "constructed",
+    noise: float = 0.01,
     device: str = "cpu",
 ) -> dict:
 
     print("=" * 60)
     print("BAYES-LEARNER EXPERIMENT")
-    print("Does gradient descent find BP weights?")
+    print(f"Init mode: {init}  Noise: {noise}")
     print("=" * 60)
 
-    # ── Data ──────────────────────────────────────────────────
     print(f"\n[DATA] Generating {n_graphs} graphs (n_vars={n_vars})...")
     t0 = time.time()
     X, Y, var_mask = make_dataset(n_graphs, n_vars)
-    print(f"[DATA] Done in {time.time()-t0:.1f}s")
-    print(f"[DATA] X shape: {list(X.shape)}  Y shape: {list(Y.shape)}")
-    print(f"[DATA] Nodes per graph: {X.shape[1]} "
-          f"({var_mask[0].sum().item()} var, "
-          f"{(~var_mask[0]).sum().item()} factor)")
+    print(f"[DATA] Done in {time.time()-t0:.1f}s  "
+          f"X={list(X.shape)}  Y={list(Y.shape)}")
 
     Y_vars = Y[var_mask]
     baseline_mae = (Y_vars - 0.5).abs().mean().item()
@@ -40,13 +38,6 @@ def train(
           f"mean:{Y_vars.mean():.4f}  std:{Y_vars.std():.4f}")
     print(f"[DATA] Baseline MAE (predict 0.5): {baseline_mae:.4f}")
 
-    # Sample a few BP outputs
-    print(f"[DATA] Sample BP posteriors (var nodes only):")
-    for i in range(3):
-        vals = Y[i][var_mask[i]].tolist()
-        print(f"  Graph {i}: {[f'{v:.4f}' for v in vals]}")
-
-    # ── Split ─────────────────────────────────────────────────
     split = int(0.9 * n_graphs)
     X_train = X[:split].to(device)
     Y_train = Y[:split].to(device)
@@ -54,27 +45,37 @@ def train(
     X_val   = X[split:].to(device)
     Y_val   = Y[split:].to(device)
     M_val   = var_mask[split:].to(device)
-    print(f"[DATA] Train: {split}  Val: {n_graphs-split}")
+    print(f"[DATA] Train: {split}  Val: {n_graphs - split}")
 
-    # ── Model ─────────────────────────────────────────────────
-    print(f"\n[MODEL] Building BPTransformer...")
-    model = BPTransformer().to(device)
+    print(f"\n[MODEL] Building BPTransformer (init={init}, noise={noise})...")
+    model = BPTransformer(init=init, noise=noise).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[MODEL] Total parameters: {n_params}")
-    for name, p in model.named_parameters():
-        print(f"[MODEL]   {name}: {list(p.shape)}")
+    print(f"[MODEL] Parameters: {n_params}")
 
-    # ── Initial weight inspection ──────────────────────────────
-    print(f"\n[INSPECT] Weights at init (should be random/near-zero):")
+    # Check attention behavior at init
+    print(f"\n[SANITY] Checking attention scores at init...")
+    with torch.no_grad():
+        x0 = X[:1]  # one graph [1, n, 8]
+        Q = model.Wq0(x0)
+        K = model.Wk0(x0)
+        scores = torch.bmm(Q, K.transpose(1, 2))[0]  # [n, n]
+        attn = torch.softmax(scores, dim=-1)[0]
+        print(f"[SANITY] Head 0 attention for node 0 (should peak at neighbor 0):")
+        print(f"  scores: {scores[0].tolist()}")
+        print(f"  attn:   {[f'{v:.4f}' for v in attn[0].tolist()]}")
+        print(f"  neighbor 0 of node 0: dim1={x0[0,0,1].item():.0f}")
+        # Check what node index matches
+        nb0_idx = int(x0[0, 0, 1].item())
+        print(f"  attn at neighbor index {nb0_idx}: {attn[0, nb0_idx].item():.4f}")
+
+    print(f"\n[INSPECT] Weights at init:")
     inspect_weights(model)
 
-    # ── Training ──────────────────────────────────────────────
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     dataset   = TensorDataset(X_train, Y_train, M_train)
     loader    = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    print(f"\n[TRAIN] Starting — {epochs} epochs, "
-          f"batch_size={batch_size}, lr={lr}")
-    print(f"[TRAIN] Batches per epoch: {len(loader)}")
+
+    print(f"\n[TRAIN] {epochs} epochs, batch={batch_size}, lr={lr}")
     print(f"\n{'Ep':>5}  {'Train Loss':>12}  {'Val MAE':>10}  "
           f"{'vs Baseline':>12}  {'Time':>6}")
     print("-" * 52)
@@ -96,13 +97,10 @@ def train(
             total_loss += loss.item() * mb.sum().item()
             total_n    += mb.sum().item()
 
-            # Log first batch of first epoch in detail
             if epoch == 1 and batch_idx == 0:
                 print(f"[TRAIN] Ep1 batch0 — loss={loss.item():.6f}  "
                       f"pred_mean={pred[mb].mean():.4f}  "
-                      f"pred_std={pred[mb].std():.4f}  "
-                      f"pred_min={pred[mb].min():.4f}  "
-                      f"pred_max={pred[mb].max():.4f}")
+                      f"pred_std={pred[mb].std():.4f}")
 
         train_loss = total_loss / total_n
 
@@ -111,23 +109,22 @@ def train(
             val_pred = model(X_val)
             val_mae  = (val_pred - Y_val)[M_val].abs().mean().item()
 
+        improvement = (baseline_mae - val_mae) / baseline_mae * 100
+        ep_time = time.time() - t_ep
+
         results["epochs"].append(epoch)
         results["train_loss"].append(train_loss)
         results["val_mae"].append(val_mae)
 
-        improvement = (baseline_mae - val_mae) / baseline_mae * 100
-        ep_time = time.time() - t_ep
         print(f"{epoch:>5}  {train_loss:>12.6f}  {val_mae:>10.6f}  "
               f"{improvement:>+11.1f}%  {ep_time:>5.2f}s")
 
-        # Periodic inspection
         if epoch % inspect_every == 0:
             print(f"\n[INSPECT] Epoch {epoch}:")
             inspect_weights(model)
             compare_posteriors(model, X_val, Y_val, M_val, n_examples=3)
             print()
 
-    # ── Final report ──────────────────────────────────────────
     print("\n" + "=" * 60)
     print("FINAL REPORT")
     print("=" * 60)
@@ -138,13 +135,11 @@ def train(
     print(f"Improvement:      {improvement:+.1f}%")
     if final_mae < 0.01:
         print(f"Result: ✓ STRONG POSITIVE — matching BP posteriors exactly")
-    elif final_mae < baseline_mae * 0.5:
+    elif improvement > 20:
         print(f"Result: ~ PARTIAL — learning but not matching exactly")
     else:
-        print(f"Result: ✗ NEGATIVE — not beating baseline meaningfully")
+        print(f"Result: ✗ NEGATIVE — not learning")
 
-    print(f"\n[INSPECT] Final weights:")
     inspect_weights(model)
     compare_posteriors(model, X_val, Y_val, M_val, n_examples=5)
-
     return results

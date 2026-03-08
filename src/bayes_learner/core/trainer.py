@@ -14,9 +14,27 @@ def train(
     lr: float = 1e-3,
     device: str = "cpu",
     print_every: int = 1,
+    analyze: bool = False,
 ) -> dict:
     print(f"Generating {n_graphs} graphs (n_vars={n_vars})...")
     X, Y = make_dataset(n_graphs, n_vars)
+
+    # Sanity check targets
+    var_mask = X[:, :, 3] == 0  # node_type dim 3 == 0 means variable
+    Y_vars = Y[var_mask]
+    print(f"Target beliefs — min:{Y_vars.min():.3f}  max:{Y_vars.max():.3f}  "
+          f"mean:{Y_vars.mean():.3f}  std:{Y_vars.std():.3f}")
+    print(f"Fraction near 0.5 (|b-0.5|<0.05): "
+          f"{((Y_vars - 0.5).abs() < 0.05).float().mean():.3f}")
+
+    if analyze:
+        # Print a few example graphs
+        from bayes_learner.core.graph import make_tree, run_bp
+        for i in range(3):
+            g = make_tree(n_vars)
+            bp = run_bp(g)
+            print(f"  Graph {i}: beliefs = {[f'{b:.3f}' for b in bp]}")
+        return {}
 
     split = int(0.9 * n_graphs)
     X_train, Y_train = X[:split].to(device), Y[:split].to(device)

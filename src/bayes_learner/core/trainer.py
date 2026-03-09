@@ -148,20 +148,14 @@ def _forward_n_rounds(model, x: torch.Tensor, n_rounds: int) -> torch.Tensor:
       - read dim 0 (updated belief) from output
       - write it back into dim 0 of the next input
       - zero dims 4 and 5 (scratch slots) for fresh gather
-
-    All other dims (neighbor indices, node type, factor table) are static
-    and carried forward unchanged.
     """
     out = x
     for _ in range(n_rounds):
-        beliefs = model.forward_embeddings(out)   # [batch, n, d_model] → we need raw output
-        # We need belief scalars, not embeddings — use full forward then inject back
-        pred = model(out)                          # [batch, n] beliefs in [0,1]
-        # Update dim 0 with new beliefs, zero scratch slots
+        pred = model(out)          # [batch, n] beliefs in [0,1]
         out = out.clone()
-        out[:, :, 0] = pred                        # update beliefs
-        out[:, :, 4] = 0.0                         # zero scratch slot 0
-        out[:, :, 5] = 0.0                         # zero scratch slot 1
+        out[:, :, 0] = pred        # update beliefs
+        out[:, :, 4] = 0.0         # zero scratch slot 0
+        out[:, :, 5] = 0.0         # zero scratch slot 1
     return pred
 
 

@@ -23,6 +23,7 @@ def train(
     make_dataset = graph_spec["make_dataset"]
     make_graph   = graph_spec["make_graph"]
     n_rounds     = graph_spec.get("n_rounds", 1)
+    d_in         = graph_spec.get("d_in", 8)
 
     print("=" * 60)
     print(f"BAYES-LEARNER EXPERIMENT: {experiment}")
@@ -55,9 +56,9 @@ def train(
     print(f"[DATA] Train: {split}  Val: {n_graphs-split}")
 
     print(f"\n[MODEL] BPTransformer — "
-          f"d_model={d_model}, heads={n_heads}, layers={n_layers}")
-    model = BPTransformer(d_model=d_model, n_heads=n_heads,
-                          n_layers=n_layers).to(device)
+          f"d_in={d_in}, d_model={d_model}, heads={n_heads}, layers={n_layers}")
+    model = BPTransformer(d_in=d_in, d_model=d_model,
+                          n_heads=n_heads, n_layers=n_layers).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[MODEL] Parameters: {n_params}")
 
@@ -82,7 +83,7 @@ def train(
 
         for xb, yb, mb in loader:
             xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
-            pred = _forward_n_rounds(model, xb, n_rounds)
+            pred = _forward_n_rounds(model, xb, n_rounds, d_in)
             loss = ((pred - yb) ** 2)[mb].mean()
             optimizer.zero_grad()
             loss.backward()
@@ -93,7 +94,7 @@ def train(
         train_loss = total_loss / total_n
         model.eval()
         with torch.no_grad():
-            val_pred = _forward_n_rounds(model, X_val.to(device), n_rounds)
+            val_pred = _forward_n_rounds(model, X_val.to(device), n_rounds, d_in)
             val_mae  = (val_pred - Y_val.to(device))[M_val.to(device)].abs().mean().item()
 
         scheduler.step(val_mae)
@@ -114,7 +115,7 @@ def train(
 
         if epoch % inspect_every == 0:
             _compare_posteriors(model, X_val, Y_val, M_val, device,
-                                n_rounds=n_rounds, n=5)
+                                n_rounds=n_rounds, d_in=d_in, n=5)
 
     print("\n" + "=" * 60)
     print("FINAL REPORT")
@@ -135,43 +136,38 @@ def train(
         print("Result: ✗ NEGATIVE — not learning")
 
     _compare_posteriors(model, X_val, Y_val, M_val, device,
-                        n_rounds=n_rounds, n=10)
+                        n_rounds=n_rounds, d_in=d_in, n=10)
     return results
 
 
-def _forward_n_rounds(model, x: torch.Tensor, n_rounds: int) -> torch.Tensor:
+def _forward_n_rounds(model, x: torch.Tensor, n_rounds: int,
+                      d_in: int = 8) -> torch.Tensor:
     """
     Run the transformer for n_rounds, updating belief (dim 0) between rounds.
-    Matches the proof's encode → transformer → decode loop.
-
-    Between rounds:
-      - read dim 0 (updated belief) from output
-      - write it back into dim 0 of the next input
-      - zero dims 4 and 5 (scratch slots) for fresh gather
+    Only dim 0 (belief) is updated between rounds — all other dims are static
+    graph structure and factor tables, which should not be zeroed.
     """
     out = x
     for _ in range(n_rounds):
-        pred = model(out)          # [batch, n] beliefs in [0,1]
+        pred = model(out)
         out = out.clone()
-        out[:, :, 0] = pred        # update beliefs
-        out[:, :, 4] = 0.0         # zero scratch slot 0
-        out[:, :, 5] = 0.0         # zero scratch slot 1
+        out[:, :, 0] = pred   # update beliefs only
     return pred
 
 
 def _compare_posteriors(model, X_val, Y_val, M_val, device,
-                        n_rounds: int = 1, n: int = 5):
+                        n_rounds: int = 1, d_in: int = 8, n: int = 5):
     model.eval()
     print(f"\n{'─'*60}")
     print(f"POSTERIOR COMPARISON (BP exact vs Transformer, {n_rounds} round(s))")
     print(f"{'─'*60}")
     with torch.no_grad():
-        pred = _forward_n_rounds(model, X_val[:n].to(device), n_rounds)
+        pred = _forward_n_rounds(model, X_val[:n].to(device), n_rounds, d_in)
     for i in range(n):
-        mask    = M_val[i]
-        bp      = Y_val[i][mask].tolist()
-        tf      = pred[i][mask].tolist()
-        errs    = [abs(a - b) for a, b in zip(bp, tf)]
+        mask = M_val[i]
+        bp   = Y_val[i][mask].tolist()
+        tf   = pred[i][mask].tolist()
+        errs = [abs(a - b) for a, b in zip(bp, tf)]
         print(f"Graph {i:2d}:  "
               f"BP=[{', '.join(f'{v:.4f}' for v in bp)}]  "
               f"TF=[{', '.join(f'{v:.4f}' for v in tf)}]  "

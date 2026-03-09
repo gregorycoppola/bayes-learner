@@ -7,18 +7,19 @@ Dating graph from QBBN paper (Coppola 2024), Figure 2.
                      like_jk ────┘
 
 7 nodes (5 variable, 2 factor):
-  Token 0: lonely    — variable, one neighbor: f_or (1)
-  Token 1: f_or      — factor,   neighbors: lonely (0), exciting (2)
-  Token 2: exciting  — variable, one neighbor: f_or (1)
-  Token 3: like_jj   — variable, two neighbors: f_or (1), f_and (5)
-  Token 4: like_jk   — variable, one neighbor: f_and (5)
-  Token 5: f_and     — factor,   neighbors: like_jj (3), like_jk (4)
-  Token 6: date      — variable, one neighbor: f_and (5)
+  Token 0: lonely    — variable, clamped prior, NOT in loss
+  Token 1: f_or      — factor
+  Token 2: exciting  — variable, clamped prior, NOT in loss
+  Token 3: like_jj   — variable, computed by BP, IN loss
+  Token 4: like_jk   — variable, clamped prior, NOT in loss
+  Token 5: f_and     — factor
+  Token 6: date      — variable, computed by BP, IN loss
 
-3 rounds of BP needed for full propagation.
+Only like_jj and date are targets — the transformer must learn to
+compute them. The clamped priors are inputs only.
 
 Encoding (d=24):
-  [0]  own_belief (init 0.5)
+  [0]  own_belief (init 0.5, or clamped prior for lonely/exciting/like_jk)
   [1]  neighbor_0_index / (n-1)
   [2]  neighbor_1_index / (n-1)   (0 if none)
   [3]  node_type (0=variable, 1=factor)
@@ -46,85 +47,49 @@ N_NODES = 7
 NORM = 6.0
 
 
-def _factor_msg(ft: List[float], b_in: float) -> float:
-    """
-    Message from a 2-input factor to one output variable,
-    marginalizing over the other input with current belief b_in.
-    ft layout: [f(0,0), f(0,1), f(1,0), f(1,1)]
-    where first index = input var, second index = output var.
-    m(out=1) = ft(in=0,out=1)*(1-b_in) + ft(in=1,out=1)*b_in
-    """
-    m1 = ft[1] * (1 - b_in) + ft[3] * b_in
-    m0 = ft[0] * (1 - b_in) + ft[2] * b_in
-    z = m0 + m1
-    return m1 / z if z > 0 else 0.5
-
-
-def _update_belief(prior: float, msg: float) -> float:
-    num = msg * prior
-    den = num + (1 - msg) * (1 - prior)
-    return num / den if den > 0 else 0.5
-
-
 def _exact_bp_3rounds(
     ft_or: List[float],
     ft_and: List[float],
     p_lonely: float,
     p_exciting: float,
     p_like_jk: float,
-) -> Tuple[float, float, float, float, float]:
+) -> Tuple[float, float]:
     """
-    Run 3 rounds of BP on the dating graph.
-
-    Clamped nodes (fixed priors): lonely, exciting, like_jk
-    Free nodes (updated by BP):   like_jj, date
-
-    Round 1: f_or sees lonely=p_lonely, exciting=p_exciting → msg to like_jj
-             f_and sees like_jj=0.5, like_jk=p_like_jk → msg to date
-    Round 2: f_and sees updated like_jj → better msg to date
-    Round 3: converge
+    Run 3 rounds of BP. Returns (P(like_jj), P(date)) only.
+    lonely, exciting, like_jk are clamped — they don't change.
     """
-    b_lonely   = p_lonely
-    b_exciting = p_exciting
-    b_like_jk  = p_like_jk
-    b_like_jj  = 0.5
-    b_date     = 0.5
+    b_like_jj = 0.5
+    b_date    = 0.5
 
     for _ in range(3):
-        # f_or → like_jj: marginalizes over lonely (using exciting belief)
-        #                  and over exciting (using lonely belief)
-        # Two-input factor: message to output = sum over both inputs
-        # m(like_jj=1) = sum_{l,e} ft_or(l,e,like_jj=1) * b(l) * b(e)
-        # With ft layout [f(0,0), f(0,1), f(1,0), f(1,1)] where
-        # first index = lonely, second = exciting... actually for 2-input
-        # factors we need to marginalize over BOTH inputs:
-        m_or_to_likejj_1 = (
-            ft_or[0] * (1-b_lonely) * (1-b_exciting) +  # f(l=0,e=0) * ...
-            ft_or[1] * (1-b_lonely) *    b_exciting  +  # f(l=0,e=1) * ...
-            ft_or[2] *    b_lonely  * (1-b_exciting) +  # f(l=1,e=0) * ...
-            ft_or[3] *    b_lonely  *    b_exciting      # f(l=1,e=1) * ...
-        )
-        m_or_to_likejj_0 = 1.0 - m_or_to_likejj_1
-        z = m_or_to_likejj_0 + m_or_to_likejj_1
-        msg_or_to_likejj = m_or_to_likejj_1 / z if z > 0 else 0.5
+        # f_or → like_jj: marginalize over both inputs
+        m1 = (ft_or[0] * (1-p_lonely) * (1-p_exciting) +
+              ft_or[1] * (1-p_lonely) *    p_exciting   +
+              ft_or[2] *    p_lonely  * (1-p_exciting)  +
+              ft_or[3] *    p_lonely  *    p_exciting)
+        m0 = 1.0 - m1
+        z  = m0 + m1
+        msg_or_to_likejj = m1 / z if z > 0 else 0.5
 
-        # f_and → date: marginalizes over like_jj and like_jk
-        m_and_to_date_1 = (
-            ft_and[0] * (1-b_like_jj) * (1-b_like_jk) +
-            ft_and[1] * (1-b_like_jj) *    b_like_jk  +
-            ft_and[2] *    b_like_jj  * (1-b_like_jk) +
-            ft_and[3] *    b_like_jj  *    b_like_jk
-        )
-        m_and_to_date_0 = 1.0 - m_and_to_date_1
-        z = m_and_to_date_0 + m_and_to_date_1
-        msg_and_to_date = m_and_to_date_1 / z if z > 0 else 0.5
+        # f_and → date: marginalize over both inputs
+        m1 = (ft_and[0] * (1-b_like_jj) * (1-p_like_jk) +
+              ft_and[1] * (1-b_like_jj) *    p_like_jk  +
+              ft_and[2] *    b_like_jj  * (1-p_like_jk) +
+              ft_and[3] *    b_like_jj  *    p_like_jk)
+        m0 = 1.0 - m1
+        z  = m0 + m1
+        msg_and_to_date = m1 / z if z > 0 else 0.5
 
-        # Update free variables
-        b_like_jj = _update_belief(0.5, msg_or_to_likejj)
-        b_date    = _update_belief(0.5, msg_and_to_date)
-        # clamped nodes don't change
+        # Update free variables with flat prior (0.5 prior, updated by msg)
+        num = msg_or_to_likejj * 0.5
+        den = num + (1 - msg_or_to_likejj) * 0.5
+        b_like_jj = num / den if den > 0 else 0.5
 
-    return b_lonely, b_exciting, b_like_jj, b_like_jk, b_date
+        num = msg_and_to_date * 0.5
+        den = num + (1 - msg_and_to_date) * 0.5
+        b_date = num / den if den > 0 else 0.5
+
+    return b_like_jj, b_date
 
 
 def _encode_ft(emb: torch.Tensor, row: int, start: int, ft: List[float]):
@@ -205,7 +170,7 @@ class DatingGraph:
 
         return emb
 
-    def exact_posteriors(self) -> Tuple[float, float, float, float, float]:
+    def exact_posteriors(self) -> Tuple[float, float]:
         return _exact_bp_3rounds(
             self.ft_or, self.ft_and,
             self.p_lonely, self.p_exciting, self.p_like_jk
@@ -239,16 +204,10 @@ def make_dataset(n_graphs: int, log_every: int = 2000):
     Y = torch.full((n_graphs, N_NODES), 0.5)
     var_mask = torch.zeros(n_graphs, N_NODES, dtype=torch.bool)
     for i, g in enumerate(graphs):
-        pl, pe, ljj, ljk, d = g.exact_posteriors()
-        Y[i, 0] = pl
-        Y[i, 2] = pe
-        Y[i, 3] = ljj
-        Y[i, 4] = ljk
-        Y[i, 6] = d
-        var_mask[i, 0] = True
-        var_mask[i, 2] = True
-        var_mask[i, 3] = True
-        var_mask[i, 4] = True
+        ljj, d = g.exact_posteriors()
+        Y[i, 3] = ljj   # like_jj
+        Y[i, 6] = d     # date
+        var_mask[i, 3] = True   # only evaluate on like_jj and date
         var_mask[i, 6] = True
 
     return X, Y, var_mask

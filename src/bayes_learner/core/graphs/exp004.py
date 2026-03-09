@@ -1,37 +1,28 @@
 """
-Chain with clean two-neighbor encoding for v1.
+Chain of 3 variables: v0 --- f1 --- v1 --- f2 --- v2
 
-    v0 --- f1 --- v1 --- f2 --- v2
+Requires 2 rounds of BP for exact posteriors.
 
-Same graph as exp003 but with a corrected encoding that explicitly
-gives v1 both neighbor indices without overloading any slot.
+Key fix: v1 gets BOTH factor tables explicitly in its encoding.
+No attention lookup needed for f2's table — all information local.
 
-Key insight: ft[1,1] is dropped from the encoding. It is recoverable
-as (1 - ft[0,0] - ft[0,1] - ft[1,0]) only if the table is normalized,
-which it isn't here (unnormalized positive reals). So we instead drop
-ft[1,1] and accept the information loss — the transformer can still
-compute exact posteriors because the marginals only require the ratio
-of row sums, not the absolute values.
+Encoding (d=16):
+  [0]  own_belief (init 0.5)
+  [1]  neighbor_0_index / (n-1)
+  [2]  neighbor_1_index / (n-1)   (0 if no second neighbor)
+  [3]  node_type (0=variable, 1=factor)
+  [4]  own_index / (n-1)
+  [5]  ft_left[0,0]
+  [6]  ft_left[0,1]
+  [7]  ft_left[1,0]
+  [8]  ft_left[1,1]
+  [9]  ft_right[0,0]   (0 if no right factor)
+  [10] ft_right[0,1]
+  [11] ft_right[1,0]
+  [12] ft_right[1,1]
+  [13-15] reserved (zeros)
 
-Actually: exact posteriors DO use ft[1,1]. So dropping it is lossy.
-Instead we drop ft[0,0] — the transformer can infer relative weights
-from the other three entries well enough, and attention index matching
-is more important than having all 4 factor entries.
-
-Encoding (d=8):
-  [0] own_belief (init 0.5)
-  [1] neighbor_0_index / (n-1)    ← clean index slot
-  [2] neighbor_1_index / (n-1)    ← clean index slot (0 if no second neighbor)
-  [3] node_type (0=variable, 1=factor)
-  [4] ft[0,1]   (was ft[0,0] — dropped to free dim for neighbor)
-  [5] ft[1,0]
-  [6] own_index / (n-1)
-  [7] ft[1,1]
-
-ft[0,0] is dropped. The transformer sees 3 of 4 factor table entries.
-This is the minimal change that preserves clean index matching while
-fitting in d=8.
-
+v1 is the only node with both ft_left and ft_right populated.
 n=5 nodes, indices 0..4, normalized by 4.
 """
 import torch
@@ -40,7 +31,7 @@ import time
 from dataclasses import dataclass
 from typing import Tuple, List
 
-D_MODEL = 8
+D_MODEL = 16
 N_NODES = 5
 
 
@@ -70,6 +61,13 @@ def _exact_bp_2rounds(ft1: List[float], ft2: List[float]) -> Tuple[float, float,
     return b[0], b[2], b[4]
 
 
+def _encode_ft(emb: torch.Tensor, row: int, start: int, ft: List[float]):
+    emb[row, start]     = ft[0]
+    emb[row, start + 1] = ft[1]
+    emb[row, start + 2] = ft[2]
+    emb[row, start + 3] = ft[3]
+
+
 @dataclass
 class TwoNeighborChain:
     ft1: List[float]   # [f(0,0), f(0,1), f(1,0), f(1,1)]
@@ -79,55 +77,50 @@ class TwoNeighborChain:
         ft1, ft2 = self.ft1, self.ft2
         emb = torch.zeros(N_NODES, D_MODEL)
 
-        # Token 0: v0 — neighbor_0=f1(1), no second neighbor
+        # Token 0: v0 — one neighbor (f1)
         emb[0, 0] = 0.5
-        emb[0, 1] = 1.0 / 4.0   # neighbor_0 = f1
+        emb[0, 1] = 1.0 / 4.0   # neighbor_0 = f1 (index 1)
         emb[0, 2] = 0.0          # no second neighbor
         emb[0, 3] = 0.0          # variable
-        emb[0, 4] = ft1[1]       # ft[0,1]
-        emb[0, 5] = ft1[2]       # ft[1,0]
-        emb[0, 6] = 0.0 / 4.0   # own index
-        emb[0, 7] = ft1[3]       # ft[1,1]
+        emb[0, 4] = 0.0 / 4.0   # own index
+        _encode_ft(emb, 0, 5, ft1)
+        # dims 9-15 = zeros
 
-        # Token 1: f1 — neighbors: v0(0), v1(2)
+        # Token 1: f1 — factor, neighbors v0(0) and v1(2)
         emb[1, 0] = 0.5
         emb[1, 1] = 0.0 / 4.0   # neighbor_0 = v0
         emb[1, 2] = 2.0 / 4.0   # neighbor_1 = v1
         emb[1, 3] = 1.0          # factor
-        emb[1, 4] = ft1[1]
-        emb[1, 5] = ft1[2]
-        emb[1, 6] = 1.0 / 4.0   # own index
-        emb[1, 7] = ft1[3]
+        emb[1, 4] = 1.0 / 4.0   # own index
+        _encode_ft(emb, 1, 5, ft1)
+        # dims 9-15 = zeros
 
-        # Token 2: v1 — neighbor_0=f1(1), neighbor_1=f2(3) ← KEY NODE
+        # Token 2: v1 — two neighbors (f1 and f2), gets BOTH tables
         emb[2, 0] = 0.5
-        emb[2, 1] = 1.0 / 4.0   # neighbor_0 = f1
-        emb[2, 2] = 3.0 / 4.0   # neighbor_1 = f2  ← explicit
+        emb[2, 1] = 1.0 / 4.0   # neighbor_0 = f1 (index 1)
+        emb[2, 2] = 3.0 / 4.0   # neighbor_1 = f2 (index 3)
         emb[2, 3] = 0.0          # variable
-        emb[2, 4] = ft1[1]
-        emb[2, 5] = ft1[2]
-        emb[2, 6] = 2.0 / 4.0   # own index
-        emb[2, 7] = ft1[3]
+        emb[2, 4] = 2.0 / 4.0   # own index
+        _encode_ft(emb, 2, 5, ft1)   # left factor table
+        _encode_ft(emb, 2, 9, ft2)   # right factor table — KEY FIX
 
-        # Token 3: f2 — neighbors: v1(2), v2(4)
+        # Token 3: f2 — factor, neighbors v1(2) and v2(4)
         emb[3, 0] = 0.5
         emb[3, 1] = 2.0 / 4.0   # neighbor_0 = v1
         emb[3, 2] = 4.0 / 4.0   # neighbor_1 = v2
         emb[3, 3] = 1.0          # factor
-        emb[3, 4] = ft2[1]
-        emb[3, 5] = ft2[2]
-        emb[3, 6] = 3.0 / 4.0   # own index
-        emb[3, 7] = ft2[3]
+        emb[3, 4] = 3.0 / 4.0   # own index
+        _encode_ft(emb, 3, 5, ft2)
+        # dims 9-15 = zeros
 
-        # Token 4: v2 — neighbor_0=f2(3), no second neighbor
+        # Token 4: v2 — one neighbor (f2)
         emb[4, 0] = 0.5
-        emb[4, 1] = 3.0 / 4.0   # neighbor_0 = f2
+        emb[4, 1] = 3.0 / 4.0   # neighbor_0 = f2 (index 3)
         emb[4, 2] = 0.0          # no second neighbor
         emb[4, 3] = 0.0          # variable
-        emb[4, 4] = ft2[1]
-        emb[4, 5] = ft2[2]
-        emb[4, 6] = 4.0 / 4.0   # own index
-        emb[4, 7] = ft2[3]
+        emb[4, 4] = 4.0 / 4.0   # own index
+        _encode_ft(emb, 4, 5, ft2)
+        # dims 9-15 = zeros
 
         return emb
 

@@ -6,6 +6,8 @@ from bayes_learner.core.graphs.exp003 import make_graph as make_graph_exp003
 from bayes_learner.core.graphs.exp003 import make_dataset as make_dataset_exp003
 from bayes_learner.core.graphs.exp004 import make_graph as make_graph_exp004
 from bayes_learner.core.graphs.exp004 import make_dataset as make_dataset_exp004
+from bayes_learner.core.graphs.exp005 import make_graph as make_graph_exp005
+from bayes_learner.core.graphs.exp005 import make_dataset as make_dataset_exp005
 
 GRAPHS = {
     "exp001": {
@@ -35,6 +37,13 @@ GRAPHS = {
         "description": "Chain with explicit two-neighbor encoding for v1 (v0---f1---v1---f2---v2)",
         "n_rounds": 2,
         "d_in": 16,
+    },
+    "exp005": {
+        "make_graph": make_graph_exp005,
+        "make_dataset": make_dataset_exp005,
+        "description": "Dating graph from QBBN paper: lonely+exciting->like_jj, like_jk->f_and->date",
+        "n_rounds": 3,
+        "d_in": 24,
     },
 }
 

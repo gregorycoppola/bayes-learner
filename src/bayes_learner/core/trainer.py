@@ -1,13 +1,13 @@
 """Training loop."""
 import time
 import torch
-import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from bayes_learner.core.model import BPTransformer
-from bayes_learner.core.graph import make_dataset, make_graph
+from bayes_learner.core.graphs import get_graph
 
 
 def train(
+    experiment: str = "exp001",
     n_graphs: int = 20000,
     epochs: int = 50,
     batch_size: int = 256,
@@ -19,13 +19,17 @@ def train(
     device: str = "cpu",
 ) -> dict:
 
+    graph_spec = get_graph(experiment)
+    make_dataset = graph_spec["make_dataset"]
+    make_graph   = graph_spec["make_graph"]
+
     print("=" * 60)
-    print("BAYES-LEARNER EXPERIMENT")
+    print(f"BAYES-LEARNER EXPERIMENT: {experiment}")
+    print(f"  {graph_spec['description']}")
     print("Can a transformer learn exact Bayesian posteriors?")
     print("=" * 60)
 
-    # ── Data ──────────────────────────────────────────────────
-    print(f"\n[DATA] Generating {n_graphs} two-variable factor graphs...")
+    print(f"\n[DATA] Generating {n_graphs} graphs...")
     t0 = time.time()
     X, Y, var_mask = make_dataset(n_graphs)
     print(f"[DATA] Done in {time.time()-t0:.1f}s")
@@ -38,22 +42,17 @@ def train(
           f"mean:{Y_vars.mean():.4f}  std:{Y_vars.std():.4f}")
     print(f"[DATA] Baseline MAE (always predict 0.5): {baseline_mae:.4f}")
 
-    # Show a few example graphs
     print(f"[DATA] Sample posteriors:")
     for i in range(5):
         g = make_graph()
-        p0, p2 = g.exact_posteriors()
-        print(f"  ft={[f'{v:.2f}' for v in g.factor_table]}  "
-              f"→  P(v0=1)={p0:.4f}  P(v2=1)={p2:.4f}")
+        posteriors = g.exact_posteriors()
+        print(f"  {posteriors}")
 
     split = int(0.9 * n_graphs)
     X_train, Y_train, M_train = X[:split], Y[:split], var_mask[:split]
     X_val,   Y_val,   M_val   = X[split:], Y[split:], var_mask[split:]
-    for t in [X_train, Y_train, M_train, X_val, Y_val, M_val]:
-        t = t.to(device)
     print(f"[DATA] Train: {split}  Val: {n_graphs-split}")
 
-    # ── Model ─────────────────────────────────────────────────
     print(f"\n[MODEL] BPTransformer — "
           f"d_model={d_model}, heads={n_heads}, layers={n_layers}")
     model = BPTransformer(d_model=d_model, n_heads=n_heads,
@@ -61,7 +60,6 @@ def train(
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[MODEL] Parameters: {n_params}")
 
-    # ── Training ──────────────────────────────────────────────
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, patience=5, factor=0.5, min_lr=1e-5)
@@ -116,7 +114,6 @@ def train(
         if epoch % inspect_every == 0:
             _compare_posteriors(model, X_val, Y_val, M_val, device, n=5)
 
-    # ── Final report ──────────────────────────────────────────
     print("\n" + "=" * 60)
     print("FINAL REPORT")
     print("=" * 60)

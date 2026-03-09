@@ -1,8 +1,13 @@
 """Train command."""
 from bayes_learner.core.trainer import train
+from bayes_learner.core.graphs import GRAPHS
+
 
 def add_subparser(subparsers):
     p = subparsers.add_parser("train", help="Train transformer on exact BP posteriors")
+    p.add_argument("experiment",      type=str,   nargs="?", default="exp001",
+                   choices=list(GRAPHS.keys()),
+                   help="Which experiment to run (default: exp001)")
     p.add_argument("--graphs",        type=int,   default=20000)
     p.add_argument("--epochs",        type=int,   default=50)
     p.add_argument("--batch-size",    type=int,   default=256)
@@ -13,8 +18,10 @@ def add_subparser(subparsers):
     p.add_argument("--inspect-every", type=int,   default=10)
     p.set_defaults(func=cmd_train)
 
+
 def cmd_train(args):
     train(
+        experiment=args.experiment,
         n_graphs=args.graphs,
         epochs=args.epochs,
         batch_size=args.batch_size,

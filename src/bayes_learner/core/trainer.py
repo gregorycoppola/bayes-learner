@@ -22,10 +22,12 @@ def train(
     graph_spec = get_graph(experiment)
     make_dataset = graph_spec["make_dataset"]
     make_graph   = graph_spec["make_graph"]
+    n_rounds     = graph_spec.get("n_rounds", 1)
 
     print("=" * 60)
     print(f"BAYES-LEARNER EXPERIMENT: {experiment}")
     print(f"  {graph_spec['description']}")
+    print(f"  BP rounds per inference: {n_rounds}")
     print("Can a transformer learn exact Bayesian posteriors?")
     print("=" * 60)
 
@@ -45,8 +47,7 @@ def train(
     print(f"[DATA] Sample posteriors:")
     for i in range(5):
         g = make_graph()
-        posteriors = g.exact_posteriors()
-        print(f"  {posteriors}")
+        print(f"  {g.exact_posteriors()}")
 
     split = int(0.9 * n_graphs)
     X_train, Y_train, M_train = X[:split], Y[:split], var_mask[:split]
@@ -81,7 +82,7 @@ def train(
 
         for xb, yb, mb in loader:
             xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
-            pred = model(xb)
+            pred = _forward_n_rounds(model, xb, n_rounds)
             loss = ((pred - yb) ** 2)[mb].mean()
             optimizer.zero_grad()
             loss.backward()
@@ -92,7 +93,7 @@ def train(
         train_loss = total_loss / total_n
         model.eval()
         with torch.no_grad():
-            val_pred = model(X_val.to(device))
+            val_pred = _forward_n_rounds(model, X_val.to(device), n_rounds)
             val_mae  = (val_pred - Y_val.to(device))[M_val.to(device)].abs().mean().item()
 
         scheduler.step(val_mae)
@@ -112,7 +113,8 @@ def train(
               f"{current_lr:>8.6f}  {ep_time:>5.2f}s")
 
         if epoch % inspect_every == 0:
-            _compare_posteriors(model, X_val, Y_val, M_val, device, n=5)
+            _compare_posteriors(model, X_val, Y_val, M_val, device,
+                                n_rounds=n_rounds, n=5)
 
     print("\n" + "=" * 60)
     print("FINAL REPORT")
@@ -132,17 +134,39 @@ def train(
     else:
         print("Result: ✗ NEGATIVE — not learning")
 
-    _compare_posteriors(model, X_val, Y_val, M_val, device, n=10)
+    _compare_posteriors(model, X_val, Y_val, M_val, device,
+                        n_rounds=n_rounds, n=10)
     return results
 
 
-def _compare_posteriors(model, X_val, Y_val, M_val, device, n=5):
+def _forward_n_rounds(model, x: torch.Tensor, n_rounds: int) -> torch.Tensor:
+    """
+    Run the transformer for n_rounds, updating belief (dim 0) between rounds.
+    Matches the proof's encode → transformer → decode loop.
+
+    Between rounds:
+      - read dim 0 (updated belief) from output
+      - write it back into dim 0 of the next input
+      - zero dims 4 and 5 (scratch slots) for fresh gather
+    """
+    out = x
+    for _ in range(n_rounds):
+        pred = model(out)          # [batch, n] beliefs in [0,1]
+        out = out.clone()
+        out[:, :, 0] = pred        # update beliefs
+        out[:, :, 4] = 0.0         # zero scratch slot 0
+        out[:, :, 5] = 0.0         # zero scratch slot 1
+    return pred
+
+
+def _compare_posteriors(model, X_val, Y_val, M_val, device,
+                        n_rounds: int = 1, n: int = 5):
     model.eval()
     print(f"\n{'─'*60}")
-    print(f"POSTERIOR COMPARISON (BP exact vs Transformer)")
+    print(f"POSTERIOR COMPARISON (BP exact vs Transformer, {n_rounds} round(s))")
     print(f"{'─'*60}")
     with torch.no_grad():
-        pred = model(X_val[:n].to(device))
+        pred = _forward_n_rounds(model, X_val[:n].to(device), n_rounds)
     for i in range(n):
         mask    = M_val[i]
         bp      = Y_val[i][mask].tolist()
